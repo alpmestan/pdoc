@@ -6,7 +6,7 @@ import System.Directory
 import Options.Applicative
 import Control.Monad (forM_, when)
 import Data.List (stripPrefix)
-import System.FilePath ((</>), replaceExtension, takeDirectory, takeFileName)
+import System.FilePath ((</>), replaceExtension, takeDirectory, takeFileName, (<.>))
 import System.Process (callProcess)
 import Data.IORef (newIORef, readIORef, atomicModifyIORef')
 
@@ -17,12 +17,16 @@ import qualified Text.Pandoc.UTF8 as T
 import Data.Maybe (fromMaybe, catMaybes)
 import Text.Pandoc.Shared (trim)
 import Data.Time (UTCTime)
+import Debug.Trace (traceShow)
+import Text.Read (readMaybe)
+import Data.Function ((&))
 
 data Opts = Opts
   { optsSrcDir  :: FilePath -- ^ root of source files for the site. /defaut: current directory/
   , optsOutDir  :: FilePath -- ^ where to put the generated site
   , optsTplsDir :: Maybe FilePath -- ^ where templtes can be found
   , optsTpl     :: Maybe String   -- ^ name of the default tenplate
+  , optsVerbose :: Bool -- ^ print additional information to stdout
   } deriving Show
 
 parseOpts :: Parser Opts
@@ -56,6 +60,11 @@ parseOpts = Opts
              <> showDefault
              <> help "Name of the template to use"
               ))
+        <*> switch
+              ( long "verbose"
+             <> short 'v'
+             <> help "Display additional information about what pdoc is doing."
+              )
 
 opts :: ParserInfo Opts
 opts = info (parseOpts <**> helper)
@@ -110,14 +119,14 @@ readMeta fp = do
     return m
     where ropts = def { readerStandalone = True, readerExtensions = pandocExtensions }
 
-data Format = HTML | PDF deriving Show
+data Format = HTML | PDF deriving (Eq, Show)
 
 lookupFormats :: Meta -> [Format]
 lookupFormats m = fromMaybe [HTML] $ do
-    fstrs <- lkp "formats" m
+    fstrs <- lkp "formats"
     return $ catMaybes (map parseFormat fstrs)
 
-    where lkp s m = lookupMeta s m >>= \mv -> case mv of
+    where lkp s = lookupMeta s m >>= \mv -> case mv of
             MetaInlines strs -> Just strs
             _ -> Nothing
           parseFormat (Str "html") = Just HTML
@@ -130,6 +139,21 @@ lookupTemplate m = T.unpack <$> lkp "template"
             MetaInlines [Str s] -> Just s
             _ -> Nothing
 
+lookupTocDepth :: Meta -> Int
+lookupTocDepth m = fromMaybe 3 $ do
+    depthStr <- T.unpack <$> lkp "toc-depth"
+    readMaybe depthStr
+
+    where lkp s = lookupMeta s m >>= \mv -> case mv of
+            MetaInlines [Str s] -> Just s
+            _ -> traceShow mv Nothing
+
+lookupTocNums :: Meta -> Bool
+lookupTocNums m = lkp "toc-nums"
+    where lkp s = lookupMeta s m & \mv -> case mv of
+            Just (MetaBool b) -> b
+            _ -> False
+
 formatArg :: Format -> String
 formatArg f = case f of
     HTML -> "html5+smart"
@@ -140,54 +164,72 @@ formatExt f = case f of
     HTML -> "html"
     PDF -> "pdf"
 
-getDocsInfo :: Opts -> [FilePath] -> IO [(FilePath, UTCTime, FilePath, Format, Maybe FilePath)]
-getDocsInfo args fps = concat <$> traverse go fps
+formatTplExt :: Format -> String
+formatTplExt f = case f of
+    HTML -> "html5"
+    PDF -> "latex"
+
+getDocsInfo :: Opts -> Maybe FilePath -> [FilePath] -> IO [(FilePath, UTCTime, FilePath, Format, Maybe (FilePath, UTCTime), Int, Bool)]
+getDocsInfo args mtplsDir fps = concat <$> traverse go fps
     where go fp = do
             mt <- getModificationTime fp
             meta <- readMeta fp
             let formats = lookupFormats meta
-                tpl = lookupTemplate meta
-            outs <- traverse (\f -> (,f) <$> makeAbsolute (outFile args fp f)) formats
-            return [ (fp, mt, o, f, tpl) | (o, f) <- outs ]
-
+                mtpl = lookupTemplate meta
+                tocDepth = lookupTocDepth meta
+                numbered = lookupTocNums meta
+            let mtpl' = (</>) <$> mtplsDir <*> (mtpl <|> optsTpl args)
+            outs <- traverse (goFormat fp mtpl') formats
+            return [ (fp, mt, o, f, tplf, tocDepth, numbered) | (f, o, tplf) <- outs ]
+          goFormat fp mtpl format = do
+            o <- makeAbsolute (outFile args fp format)
+            mtpl' <- flip traverse mtpl $ \tplBasePath -> do
+                let tplPath = tplBasePath <.> formatTplExt format
+                tplmt <- getModificationTime tplPath
+                return (tplPath, tplmt)
+            return (format, o, mtpl')
 
 main :: IO ()
 main = do
     args <- execParser opts
     docs <- map (optsSrcDir args </>) <$> getDirectoryFiles (optsSrcDir args) ["**/*.md"]
     mtplsDir <- traverse makeAbsolute (optsTplsDir args)
-    let defTpl = optsTpl args
     pdocd <- getPdocDir
     storepath <- getPdocStore
     pdocdb <- loadStore storepath
     pdocdbref <- newIORef pdocdb
-    docsInfo <- getDocsInfo args docs
-    let todoDocs = filter (\(_fp, time, out, _f, _tpl) -> needsWork out time pdocdb) docsInfo
+    docsInfo <- getDocsInfo args mtplsDir docs
+    let todoDocs = filter (\(_fp, time, out, _f, mtpl, _td, _num) -> needsWork out time mtpl pdocdb) docsInfo
     let ndocs = length todoDocs
     when (ndocs == 0) $ putStrLn "Nothing to do."
-    forM_ (zip [(1::Int)..] todoDocs) $ \(i, (docPath, docMTime, outpath, format, mtpl)) -> do
+    forM_ (zip [(1::Int)..] todoDocs) $ \(i, (docPath, docMTime, outpath, format, mtpl, tocDepth, numbered)) -> do
         let pandocArgs = [ "--embed-resources"
                         , "--standalone"
                         , "--katex"
                         , "--from", "markdown"
                         , "--to", formatArg format
-                        -- , "--filter", "pandoc-sidenote"
                         , "--filter", "pandoc-plot"
                         , "--filter", "pdoc-list"
                         , "--filter", "diagrams-pandoc"
+                        , "--filter", "pandoc-sidenote"
                         , "-M", "plot-configuration=" ++ (pdocd </> "pandoc-plot.yml")
                         , "--toc"
-                        , "--wrap=auto"
+                        , "--toc-depth=" ++ show tocDepth
+                        ] ++
+                        [ "-N" | numbered ] ++
+                        concat [ [ "-f", "markdown-implicit_figures" ] | format == PDF ] ++
+                        [ "--wrap=auto"
                         ] ++ (fromMaybe [] $
-                                do tplsDir <- mtplsDir
-                                   tpl <- mtpl <|> optsTpl args
-                                   return ["--template", tplsDir </> tpl]
+                                do (tplPath, _) <- mtpl
+                                   return ["--template", tplPath]
                              ) ++
                         [ "-o", outpath
                         , takeFileName docPath
                         ]
         createDirectoryIfMissing True (takeDirectory outpath)
         putStrLn $ "[" ++ show i ++ "/" ++ show ndocs ++ "] " ++ docPath ++ " -> " ++ outpath
+        when (optsVerbose args) $ putStrLn $
+            ">> pandoc " ++ unwords pandocArgs
         withCurrentDirectory (takeDirectory docPath) $ callProcess "pandoc" pandocArgs
-        atomicModifyIORef' pdocdbref $ \db -> (record outpath docPath docMTime db, ())
+        atomicModifyIORef' pdocdbref $ \db -> (record outpath docPath docMTime mtpl db, ())
     saveStore storepath =<< readIORef pdocdbref
