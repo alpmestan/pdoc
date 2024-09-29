@@ -96,12 +96,12 @@ saveStore fp = writeFile fp . show
 plotYml :: FilePath -> String
 plotYml pdocd = unlines
     [ "directory: " ++ (pdocd </> "plots")
-    , "format: PNG"
+    , "format: SVG"
     , "matplotlib:"
     , "  transparent: true"
     , "  tight_bbox: true"
     , "d2:"
-    , "  command_line_arguments: --sketch --scale 1 --dark-theme 200"
+    , "  command_line_arguments: --sketch --scale -1" {- --dark-theme 200" -}
     ]
 
 rebase :: Opts -> FilePath -> FilePath
@@ -172,6 +172,7 @@ formatTplExt f = case f of
 getDocsInfo :: Opts -> Maybe FilePath -> [FilePath] -> IO [(FilePath, UTCTime, FilePath, Format, Maybe (FilePath, UTCTime), Int, Bool)]
 getDocsInfo args mtplsDir fps = concat <$> traverse go fps
     where go fp = do
+            dbg $ "Getting info of: " ++ fp
             mt <- getModificationTime fp
             meta <- readMeta fp
             let formats = lookupFormats meta
@@ -189,16 +190,28 @@ getDocsInfo args mtplsDir fps = concat <$> traverse go fps
                 return (tplPath, tplmt)
             return (format, o, mtpl')
 
+dbg :: String -> IO ()
+-- dbg = putStrLn
+dbg _ = return ()
+
 main :: IO ()
 main = do
+    dbg "Welcome to pdoc"
     args <- execParser opts
+    dbg "Got CLI opts"
     docs <- map (optsSrcDir args </>) <$> getDirectoryFiles (optsSrcDir args) ["**/*.md"]
+    dbg $ "docs: " ++ show docs
     mtplsDir <- traverse makeAbsolute (optsTplsDir args)
+    dbg "Got tpl dir"
     pdocd <- getPdocDir
+    dbg "Got pdoc dir"
     storepath <- getPdocStore
+    dbg "Got pdoc store path"
     pdocdb <- loadStore storepath
+    dbg "Got pdoc store"
     pdocdbref <- newIORef pdocdb
     docsInfo <- getDocsInfo args mtplsDir docs
+    dbg "Got docs info"
     let todoDocs = filter (\(_fp, time, out, _f, mtpl, _td, _num) -> needsWork out time mtpl pdocdb) docsInfo
     let ndocs = length todoDocs
     when (ndocs == 0) $ putStrLn "Nothing to do."

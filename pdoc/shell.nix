@@ -14,7 +14,8 @@ let tex = texlive.combined.scheme-medium;
                    pdoc-list
                    d2
                    librsvg
-                   diagrams-pandoc
+                   hs.diagrams-pandoc
+                   hs.haskell-language-server
                  ];
 in
 mkShell {
